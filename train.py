@@ -3,12 +3,19 @@ import torch.nn as nn
 from torch.nn import functional as F
 import time
 import transformer_engine.pytorch as te
-from transformer_engine.common.recipe import Format, DelayedScaling, Float8BlockScaling,Float8CurrentScaling
+from transformer_engine.pytorch.fp8 import check_fp8_block_scaling_support,check_mxfp8_support,check_nvfp4_support,get_device_compute_capability
+from transformer_engine.common.recipe import Format, DelayedScaling, Float8BlockScaling,Float8CurrentScaling,NVFP4BlockScaling
 from normuon import SingleDeviceNorMuonWithAuxAdam
 import bitsandbytes as bnb
 
+print ("Transformer Engine FP8 support status:")
+print("\nFP8 Block Scaling Support:", check_fp8_block_scaling_support())
+print("\nMXFP8 Support:", check_mxfp8_support())
+print("\nNVFP4 Support:", check_nvfp4_support())
+print("\nDevice Compute Capability:", get_device_compute_capability())
+
 # hyperparameters
-batch_size = 8 # how many independent sequences will we process in parallel?
+batch_size = 4 # how many independent sequences will we process in parallel?
 block_size = 512 # what is the maximum context length for predictions?
 max_iters = 5000
 eval_interval = 100
@@ -84,21 +91,20 @@ class BigramLanguageModel(nn.Module):
             hidden_size=n_embd, 
             ffn_hidden_size=4*n_embd, 
             num_attention_heads=n_head,
-            attn_input_format='bshd'  # Critical: our input is (batch, seq, hidden)
+            attn_input_format='bshd',  # Critical: our input is (batch, seq, hidden)
+            layer_number=i+1
         ) for i in range(n_layer)})
         self.ln_f = te.LayerNorm(n_embd) # final layer norm
         self.lm_head = te.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
-
         # idx and targets are both (B,T) tensor of integers
         tok_emb = self.token_embedding_table(idx) # (B,T,C)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
         x = tok_emb + pos_emb # (B,T,C)
         for i in range(n_layer):
             x = self.blocks[f"block_{i}"](x, self_attn_mask_type="causal")
-            
         x = self.ln_f(x) # (B,T,C)
         logits = self.lm_head(x) # (B,T,vocab_size)
 
@@ -131,10 +137,8 @@ class BigramLanguageModel(nn.Module):
 
 model = BigramLanguageModel()
 model = model.to(device)
-# print the number of parameters in the model
+
 print(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
-# create a PyTorch optimizer
-# use AdamW8bit to match the original training script for comparable optimization behavior
 
 hidden_weights = [p for p in model.blocks.parameters() if p.ndim >= 2]
 hidden_gains_biases = [p for p in model.blocks.parameters() if p.ndim < 2]
@@ -145,6 +149,8 @@ param_groups = [
     dict(params=hidden_gains_biases+nonhidden_params, use_muon=False,
          lr=3e-4, betas=(0.9, 0.95), weight_decay=0.01),
 ]
+torch.backends.cuda.matmul.fp32_precision = 'ieee'
+torch.backends.cudnn.conv.fp32_precision = 'tf32'
 # optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=learning_rate)
 optimizer = SingleDeviceNorMuonWithAuxAdam(param_groups)
 fp8_recipe = Float8CurrentScaling(fp8_format=Format.HYBRID, amax_history_len=16, amax_compute_algo="max")
@@ -158,8 +164,6 @@ for iter in range(max_iters):
         print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
     # sample a batch of data
     xb, yb = get_batch('train')
-    torch.backends.cuda.matmul.fp32_precision = 'ieee'
-    torch.backends.cudnn.conv.fp32_precision = 'tf32'
     
     with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
         # evaluate the loss
