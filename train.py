@@ -156,7 +156,7 @@ class BigramLanguageModel(nn.Module):
             micro_batch_size=batch_size,
             
         ) for i in range(n_layer)}) 
-        self.ln_f = te.LayerNorm(n_embd) # final layer norm
+        self.ln_f = te.RMSNorm(n_embd) # final layer norm
         self.lm_head = te.Linear(n_embd, vocab_size,bias=False)
         # self.token_embedding_table.weight = self.lm_head.weight # tie weights
     
@@ -234,10 +234,10 @@ torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
 #                                   lr=param_groups[0]['lr'],
 #                                   weight_decay=param_groups[0]['weight_decay'])
 
-optimizer_muon = torch.optim.Muon(param_groups[0]['params'],
-                                  lr=param_groups[0]['lr'],
-                                  weight_decay=param_groups[0]['weight_decay'],)
-optimizer_adamw = torch.optim.AdamW(param_groups[1]['params'],
+# optimizer_muon = torch.optim.Muon(param_groups[0]['params'],
+#                                   lr=param_groups[0]['lr'],
+#                                   weight_decay=param_groups[0]['weight_decay'],)
+optimizer_adamw = torch.optim.AdamW(model.parameters(),
                                     lr=param_groups[1]['lr'],
                                     betas=param_groups[1]['betas'],
                                     weight_decay=param_groups[1]['weight_decay'],
@@ -247,6 +247,7 @@ optimizer_adamw = torch.optim.AdamW(param_groups[1]['params'],
                                     # foreach=True
                                     )
 
+
     
 gradScaler = torch.amp.GradScaler(device='cuda', enabled=USE_AMP)
 
@@ -254,8 +255,9 @@ gradScaler = torch.amp.GradScaler(device='cuda', enabled=USE_AMP)
 @torch.compile()
 def gradscaler_step_adamw():
     gradScaler.step(optimizer_adamw)
+    
 def gradscaler_step():
-    gradScaler.step(optimizer_muon)
+    # gradScaler.step(optimizer_muon)
     gradscaler_step_adamw()
 
 
@@ -274,7 +276,7 @@ if USE_CUDA_GRAPH:
             static_input.copy_(xb)
             static_target.copy_(yb)
             
-            optimizer_muon.zero_grad(set_to_none=True)
+            # optimizer_muon.zero_grad(set_to_none=True)
             optimizer_adamw.zero_grad(set_to_none=True)
             
             with torch.amp.autocast('cuda', enabled=USE_AMP, dtype=torch.bfloat16):
@@ -287,7 +289,7 @@ if USE_CUDA_GRAPH:
     print("Capturing CUDA graph...")
     g = torch.cuda.CUDAGraph()
     
-    optimizer_muon.zero_grad(set_to_none=True)
+    # optimizer_muon.zero_grad(set_to_none=True)
     optimizer_adamw.zero_grad(set_to_none=True)
     
     with torch.cuda.graph(g):
@@ -325,7 +327,7 @@ for iter in range(max_iters):
         loss = static_loss
     else:
         # Original non-graph path
-        optimizer_muon.zero_grad()
+        # optimizer_muon.zero_grad()
         optimizer_adamw.zero_grad()
         xb, yb = get_batch('train')
         
@@ -349,11 +351,16 @@ for iter in range(max_iters):
         total_training_time += dt
     
     if should_print:
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(), 
+            max_norm=float('inf')  # No clipping, just return the norm
+        )
         print(f"step {iter}: train loss {loss.detach():.4f}")
         print(f"iter time: {dt:.4f}s | tok/sec: {tok_per_sec:,}")
         print(f"total time: {total_training_time/60:.2f} min")
         free, total = torch.cuda.mem_get_info(device)
         mem_used_GB = (total - free) / 1024 ** 3
+        print(f"grad norm: {grad_norm:.4f}")
         print(f"{mem_used_GB:.2f} GB used")
         print('------------')
     if iter % eval_interval == 0 and iter > 0:
@@ -362,7 +369,9 @@ for iter in range(max_iters):
             losses = estimate_loss(reuse_input=static_input, reuse_target=static_target)
         else:
             losses = estimate_loss(reuse_input=xb, reuse_target=yb)
+        print('---- eval ----')
         print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print('------------')
 
 # generate from the model
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
