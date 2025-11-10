@@ -2,6 +2,7 @@ import torch
 import torch.distributed as dist
 
 # copied from https://github.com/KellerJordan/Muon/blob/master/muon.py
+@torch.compile()
 def zeropower_via_newtonschulz5(G, steps=5):
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
@@ -31,7 +32,7 @@ def zeropower_via_newtonschulz5(G, steps=5):
     return X
 
 
-
+@torch.compile()
 def normuon_update(grad, momentum, second_momentum, beta=0.95, beta2=0.95, ns_steps=5, nesterov=True):
     momentum.lerp_(grad, 1 - beta)
     update = grad.lerp_(momentum, beta) if nesterov else momentum
@@ -94,6 +95,7 @@ class NorMuon(torch.optim.Optimizer):
         return loss
 
 # modified from https://github.com/KellerJordan/Muon/blob/master/muon.py
+@torch.compile()
 class SingleDeviceNorMuon(torch.optim.Optimizer):
     """
     Muon variant for usage in non-distributed settings.
