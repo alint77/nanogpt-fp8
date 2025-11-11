@@ -31,20 +31,21 @@ USE_DDP = True
 
 # hyperparameters
 # total_batch_size = 524288 # total tokens per batch
-batch_size = 4 # how many independent sequences will we process in parallel?
-block_size = 2048 # what is the maximum context length for predictions?
+batch_size = 24 # how many independent sequences will we process in parallel?
+block_size = 1024 # what is the maximum context length for predictions?
 max_iters = 5000
 print_interval = 20
 eval_interval = 300
 learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 20
-n_layer = 20
+n_layer = 12
 n_embd = n_layer*64
 n_head = max(1, (n_embd + 127) // 128)
 dropout = 0.0
-vocab_size = 65536
-grad_accum_steps = 32
+vocab_size = 50304
+grad_accum_steps = 16
+dataset = 'openwebtext-1M'  # name of the dataset subdirectory in ./data/
 # ------------
 print("n_layer:", n_layer, "n_embd:", n_embd, "n_head:", n_head, "batch_size:", batch_size, "block_size:", block_size)
 fp8_recipe = DelayedScaling()
@@ -96,18 +97,37 @@ else:
 
 torch.manual_seed(1337 + seed_offset)
 
+# @torch.no_grad()
+# def get_batch(split):
+#     data = train_data if split == 'train' else val_data
+#     ix = torch.randint(len(data) - block_size, (batch_size,))
+#     # Vectorized indexing - much faster than list comprehension
+#     idx_x = ix.unsqueeze(1) + torch.arange(block_size, device='cpu')
+#     idx_y = idx_x + 1
+#     x = data[idx_x]  # Fancy indexing: (batch_size, block_size)
+#     y = data[idx_y]
+#     x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+#     return x, y
+
+
+data_dir = os.path.join('data', dataset)
 @torch.no_grad()
 def get_batch(split):
-    data = train_data if split == 'train' else val_data
+    # We recreate np.memmap every batch to avoid a memory leak, as per
+    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+    if split == 'train':
+        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+    else:
+        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
     ix = torch.randint(len(data) - block_size, (batch_size,))
-    # Vectorized indexing - much faster than list comprehension
-    idx_x = ix.unsqueeze(1) + torch.arange(block_size, device='cpu')
-    idx_y = idx_x + 1
-    x = data[idx_x]  # Fancy indexing: (batch_size, block_size)
-    y = data[idx_y]
-    x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    if device == 'cuda':
+        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
+        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+    else:
+        x, y = x.to(device), y.to(device)
     return x, y
-
 
 @torch.no_grad()
 def estimate_loss(reuse_input=None, reuse_target=None):
@@ -261,14 +281,14 @@ torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
 
 # optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=learning_rate)
 
-# optimizer_muon = NorMuon(param_groups[0]['params'],
-#                                     lr=param_groups[0]['lr'],
-#                                     weight_decay=param_groups[0]['weight_decay'])
+optimizer_muon = NorMuon(param_groups[0]['params'],
+                                    lr=param_groups[0]['lr'],
+                                    weight_decay=param_groups[0]['weight_decay'])
 
 # optimizer_muon = torch.optim.Muon(param_groups[0]['params'],
 #                                   lr=param_groups[0]['lr'],
 #                                   weight_decay=param_groups[0]['weight_decay'],)
-optimizer_adamw = torch.optim.AdamW(model.parameters(),
+optimizer_adamw = torch.optim.AdamW(param_groups[1]['params'],
                                     lr=param_groups[1]['lr'],
                                     betas=param_groups[1]['betas'],
                                     weight_decay=param_groups[1]['weight_decay'],
@@ -296,15 +316,15 @@ def gradscaler_step_adamw():
     gradScaler.step(optimizer_adamw)
     
 def gradscaler_step():
-    # gradScaler.step(optimizer_muon)
+    gradScaler.step(optimizer_muon)
     gradscaler_step_adamw()
     
 def optimizer_zero_grad():
-    # optimizer_muon.zero_grad()
+    optimizer_muon.zero_grad()
     optimizer_adamw.zero_grad()
 
 def gradscaler_unscale():
-    # gradScaler.unscale_(optimizer_muon)
+    gradScaler.unscale_(optimizer_muon)
     gradScaler.unscale_(optimizer_adamw)
 
 
