@@ -11,6 +11,9 @@ import bitsandbytes as bnb
 import numpy as np
 import os
 
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+
+
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import torch.distributed as dist
@@ -51,6 +54,11 @@ grad_accum_steps = 64
 dataset = 'openwebtext-1M'  # name of the dataset subdirectory in ./data/
 input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
 input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+
+warmup_iters = 100  # Number of warmup steps
+lr_decay_iters = max_iters  # Should be ~= max_iters
+min_lr = 1e-4  # Minimum learning rate (10% of max LR is typical)
+
 # ------------
 print("n_layer:", n_layer, "n_embd:", n_embd, "n_head:", n_head, "batch_size:", batch_size, "block_size:", block_size)
 fp8_recipe = DelayedScaling()
@@ -102,46 +110,7 @@ else:
 
 torch.manual_seed(1337 + seed_offset)
 
-# @torch.no_grad()
-# def get_batch(split):
-#     data = train_data if split == 'train' else val_data
-#     ix = torch.randint(len(data) - block_size, (batch_size,))
-#     # Vectorized indexing - much faster than list comprehension
-#     idx_x = ix.unsqueeze(1) + torch.arange(block_size, device='cpu')
-#     idx_y = idx_x + 1
-#     x = data[idx_x]  # Fancy indexing: (batch_size, block_size)
-#     y = data[idx_y]
-#     x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-#     return x, y
-
-
 data_dir = os.path.join('data', dataset)
-
-# Initialize optimized dataloaders
-# Note: VectorizedFastDataLoader is used here for maximum performance
-# It uses pre-allocated pinned memory and vectorized numpy operations
-# train_loader = VectorizedFastDataLoader(
-#     data_path=data_dir,
-#     block_size=block_size,
-#     batch_size=batch_size,
-#     split='train',
-#     device=device,
-#     seed=1337,
-#     rank=seed_offset if USE_DDP else 0
-# )
-
-# val_loader = VectorizedFastDataLoader(
-#     data_path=data_dir,
-#     block_size=block_size,
-#     batch_size=batch_size,
-#     split='val',
-#     device=device,
-#     seed=1337,
-#     rank=seed_offset if USE_DDP else 0
-# )
-
-# -----------------------------------------------------------------------------
-# Our own simple Distributed Data Loader
 
 def _peek_data_shard(filename):
     # only reads the header, returns header data
@@ -405,6 +374,15 @@ optimizer_adamw = torch.optim.AdamW(param_groups[1]['params'],
     
 gradScaler = torch.amp.GradScaler(device='cuda', enabled=USE_AMP)
 
+# After creating optimizers:
+warmup_scheduler_muon = LinearLR(optimizer_muon, start_factor=0.1, total_iters=warmup_iters)
+main_scheduler_muon = CosineAnnealingLR(optimizer_muon, T_max=max_iters - warmup_iters, eta_min=min_lr)
+scheduler_muon = SequentialLR(optimizer_muon, [warmup_scheduler_muon, main_scheduler_muon], milestones=[warmup_iters])
+
+warmup_scheduler_adamw = LinearLR(optimizer_adamw, start_factor=0.1, total_iters=warmup_iters)
+main_scheduler_adamw = CosineAnnealingLR(optimizer_adamw, T_max=max_iters - warmup_iters, eta_min=min_lr)
+scheduler_adamw = SequentialLR(optimizer_adamw, [warmup_scheduler_adamw, main_scheduler_adamw], milestones=[warmup_iters])
+
 
 # Wrap with DDP BEFORE compiling (as per TE docs)
 if USE_DDP:
@@ -423,6 +401,8 @@ def gradscaler_step_adamw():
 def gradscaler_step():
     gradScaler.step(optimizer_muon)
     gradscaler_step_adamw()
+    scheduler_muon.step()
+    scheduler_adamw.step()
     
 def optimizer_zero_grad():
     optimizer_muon.zero_grad()
@@ -544,6 +524,7 @@ for iter in range(max_iters):
         
         print(f"step {iter}: train loss {loss.detach():.4f}")
         print(f"iter time: {dt:.4f}s | tok/sec: {tok_per_sec:,}")
+        print(f"lr: Muon:{scheduler_muon.get_last_lr()[0]:.6f}, AdamW: {scheduler_adamw.get_last_lr()[0]:.6f}")  # Add this line
         print(f"total time: {total_training_time/60:.2f} min")
         free, total = torch.cuda.mem_get_info(device)
         mem_used_GB = (total - free) / 1024 ** 3
