@@ -14,6 +14,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import torch.distributed as dist
 
+from dataloader import VectorizedFastDataLoader, create_dataloader
+
 
 
 print ("Transformer Engine FP8 support status:")
@@ -111,23 +113,37 @@ torch.manual_seed(1337 + seed_offset)
 
 
 data_dir = os.path.join('data', dataset)
+
+# Initialize optimized dataloaders
+# Note: VectorizedFastDataLoader is used here for maximum performance
+# It uses pre-allocated pinned memory and vectorized numpy operations
+train_loader = VectorizedFastDataLoader(
+    data_path=data_dir,
+    block_size=block_size,
+    batch_size=batch_size,
+    split='train',
+    device=device,
+    seed=1337,
+    rank=seed_offset if USE_DDP else 0
+)
+
+val_loader = VectorizedFastDataLoader(
+    data_path=data_dir,
+    block_size=block_size,
+    batch_size=batch_size,
+    split='val',
+    device=device,
+    seed=1337,
+    rank=seed_offset if USE_DDP else 0
+)
+
 @torch.no_grad()
 def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+    """Get a batch from the appropriate dataloader."""
     if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+        return train_loader.get_batch()
     else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    if device == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+        return val_loader.get_batch()
 
 @torch.no_grad()
 def estimate_loss(reuse_input=None, reuse_target=None):
