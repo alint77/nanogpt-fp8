@@ -1,0 +1,6 @@
+torch 
+datasets 
+tqdm 
+buildtools 
+transformer_engine[pytorch] 
+bitsandbytes

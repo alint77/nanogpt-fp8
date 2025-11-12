@@ -28,6 +28,8 @@ print("\nNVFP4 Support:", te.is_nvfp4_available())
 print("\nDevice Compute Capability:", te.get_device_compute_capability())
 
 USE_FP8 = True
+USE_NVFP4 = True
+USE_COMPILE_MODEL = False
 USE_AMP = True
 USE_FP8_WEIGHTS = False
 USE_DDP = True
@@ -35,7 +37,7 @@ USE_DDP = True
 
 # hyperparameters
 total_batch_size = 524288 # total tokens per batch
-batch_size = 32 # how many independent sequences will we process in parallel?
+batch_size = 16 # how many independent sequences will we process in parallel?
 block_size = 2048 # what is the maximum context length for predictions?
 max_iters = 5000
 print_interval = 20
@@ -58,7 +60,15 @@ min_lr = 1e-4  # Minimum learning rate (10% of max LR is typical)
 
 # ------------
 print("n_layer:", n_layer, "n_embd:", n_embd, "n_head:", n_head, "batch_size:", batch_size, "block_size:", block_size)
-recipe = DelayedScaling()
+
+check_compute_capability = te.get_device_compute_capability()
+
+if USE_NVFP4:
+    # RTX 5000 series and RTX Pro 6000 do not support rht and sr as of TE==2.9.0
+    is_rtx = check_compute_capability == (12,0) 
+    recipe = NVFP4BlockScaling(disable_rht=is_rtx,disable_stochastic_rounding=is_rtx)
+else:
+    recipe = DelayedScaling()
 
 if USE_DDP:
     init_process_group(backend='nccl')
@@ -207,7 +217,7 @@ def estimate_loss(reuse_input=None, reuse_target=None):
             eval_input.copy_(x[:eval_batch_size], non_blocking=True)
             eval_target.copy_(y[:eval_batch_size], non_blocking=True)
             
-            with torch.amp.autocast('cuda', enabled=USE_AMP, dtype=torch.bfloat16),te.autocast(enabled=USE_FP8, recipe=recipe, amax_reduction_group=amax_reduction_group):
+            with torch.amp.autocast('cuda', enabled=USE_AMP, dtype=torch.bfloat16),te.autocast(enabled=(USE_FP8 or USE_NVFP4), recipe=recipe, amax_reduction_group=amax_reduction_group):
                 _, loss = raw_model(eval_input, eval_target)
             
             loss_sum += loss.item()
@@ -335,9 +345,9 @@ optimizer_adamw = torch.optim.AdamW(param_groups[1]['params'],
                                     lr=torch.tensor(param_groups[1]['lr']),
                                     betas=param_groups[1]['betas'],
                                     weight_decay=param_groups[1]['weight_decay'],
-                                    capturable=True,
+                                    # capturable=True,
                                     # optim_bits=8,
-                                    # fused=True,
+                                    fused=True,
                                     # foreach=True
                                     )
     
@@ -361,9 +371,10 @@ else:
     raw_model = model
 
 # Compile after wrapping with DDP
-model = torch.compile(model,mode="max-autotune-no-cudagraphs")
+if USE_COMPILE_MODEL:
+    model = torch.compile(model,dynamic=False,mode='max-autotune-no-cudagraphs')
 
-@torch.compile()
+# @torch.compile(dynamic=False)
 def gradscaler_step_adamw():
     gradScaler.step(optimizer_adamw)
     scheduler_adamw.step()
@@ -398,7 +409,7 @@ for iter in range(max_iters):
         model.require_backward_grad_sync = ((iter + 1) % grad_accum_steps == 0)       
     with torch.amp.autocast('cuda', enabled=USE_AMP, dtype=torch.bfloat16):
         # Use amax_reduction_group for proper FP8 scaling factor synchronization across GPUs (TE best practice)
-        with te.autocast(enabled=USE_FP8, recipe=recipe, amax_reduction_group=amax_reduction_group):
+        with te.autocast(enabled=(USE_FP8 or USE_NVFP4), recipe=recipe, amax_reduction_group=amax_reduction_group):
             _, loss = model(xb, yb, is_first_microbatch=(iter % grad_accum_steps == 0))
     
     # Scale loss for gradient accumulation
