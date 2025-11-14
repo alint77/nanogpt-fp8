@@ -13,10 +13,12 @@ import os
 
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-
-from torch.nn.parallel import DistributedDataParallel as DDP
+from functools import partial
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, MixedPrecision
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.distributed import init_process_group, destroy_process_group
 import torch.distributed as dist
+from transformer_engine.pytorch.distributed import prepare_te_modules_for_fsdp
 
 
 
@@ -32,7 +34,7 @@ USE_NVFP4 = True
 USE_COMPILE_MODEL = False
 USE_AMP = True
 USE_FP8_WEIGHTS = False
-USE_DDP = True
+USE_FSDP = True
 
 
 # hyperparameters
@@ -70,7 +72,7 @@ if USE_NVFP4:
 else:
     recipe = DelayedScaling()
 
-if USE_DDP:
+if USE_FSDP:
     init_process_group(backend='nccl')
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
@@ -79,7 +81,7 @@ if USE_DDP:
     torch.cuda.set_device(device)
     master_process = ddp_rank == 0 
     seed_offset = ddp_rank 
-    data_parallel_group = torch.distributed.group.WORLD
+    data_parallel_group = dist.new_group(backend='nccl')
     amax_reduction_group = data_parallel_group  
 else:
     master_process = True
@@ -173,8 +175,8 @@ class DistributedDataLoader:
             self.advance()
         return x.cuda(), y.cuda()
 
-train_loader = DistributedDataLoader(input_bin, batch_size, block_size, ddp_rank if USE_DDP else 0, ddp_world_size if USE_DDP else 1)
-val_loader = DistributedDataLoader(input_val_bin, batch_size, block_size, ddp_rank if USE_DDP else 0, ddp_world_size if USE_DDP else 1)
+train_loader = DistributedDataLoader(input_bin, batch_size, block_size, ddp_rank if USE_FSDP else 0, ddp_world_size if USE_FSDP else 1)
+val_loader = DistributedDataLoader(input_val_bin, batch_size, block_size, ddp_rank if USE_FSDP else 0, ddp_world_size if USE_FSDP else 1)
 if master_process:
     print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
     print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
@@ -253,7 +255,7 @@ class LLM(nn.Module):
             fuse_qkv_params=True,
             seq_length=block_size,
             micro_batch_size=batch_size,
-            set_parallel_mode=USE_DDP,
+            set_parallel_mode=USE_FSDP,
             # num_gqa_groups=n_head//2,
             # fuse_wgrad_accumulation=True,
             
@@ -329,6 +331,32 @@ torch.backends.cudnn.rnn.fp32_precision = "tf32"
 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
 torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
 
+# Wrap with FSDP BEFORE compiling
+if USE_FSDP:
+    # Use transformer_auto_wrap_policy for TransformerLayer modules
+    fsdp_wrap_policy = partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={te.TransformerLayer}
+    )
+    
+    model = FSDP(
+        model,
+        process_group=data_parallel_group,
+        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,  # Only shard optimizer states and gradients
+        use_orig_params=True,
+        mixed_precision=MixedPrecision(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+        ),
+        auto_wrap_policy=fsdp_wrap_policy,
+    )
+    
+    # Prepare TE modules to shard internal buffers that FSDP cannot shard on its own
+    prepare_te_modules_for_fsdp(model)
+    
+    raw_model = model
+else:
+    raw_model = model
 
 
 
@@ -337,11 +365,11 @@ torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
 #                                     lr=param_groups[0]['lr'],
 #                                     weight_decay=param_groups[0]['weight_decay'])
 
-optimizer_muon = torch.optim.Muon(param_groups[0]['params'],
-                                  lr=torch.tensor(param_groups[0]['lr']),
-                                  weight_decay=param_groups[0]['weight_decay'],)
+# optimizer_muon = torch.optim.Muon(param_groups[0]['params'],
+#                                   lr=torch.tensor(param_groups[0]['lr']),
+#                                   weight_decay=param_groups[0]['weight_decay'],)
 
-optimizer_adamw = torch.optim.AdamW(param_groups[1]['params'],
+optimizer_adamw = torch.optim.AdamW(model.parameters(),
                                     lr=torch.tensor(param_groups[1]['lr']),
                                     betas=param_groups[1]['betas'],
                                     weight_decay=param_groups[1]['weight_decay'],
@@ -354,23 +382,17 @@ optimizer_adamw = torch.optim.AdamW(param_groups[1]['params'],
 gradScaler = torch.amp.GradScaler(device='cuda', enabled=USE_AMP)
 
 # After creating optimizers:
-warmup_scheduler_muon = LinearLR(optimizer_muon, start_factor=0.1, total_iters=warmup_iters)
-main_scheduler_muon = CosineAnnealingLR(optimizer_muon, T_max=max_iters - warmup_iters, eta_min=min_lr)
-scheduler_muon = SequentialLR(optimizer_muon, [warmup_scheduler_muon, main_scheduler_muon], milestones=[warmup_iters])
+# warmup_scheduler_muon = LinearLR(optimizer_muon, start_factor=0.1, total_iters=warmup_iters)
+# main_scheduler_muon = CosineAnnealingLR(optimizer_muon, T_max=max_iters - warmup_iters, eta_min=min_lr)
+# scheduler_muon = SequentialLR(optimizer_muon, [warmup_scheduler_muon, main_scheduler_muon], milestones=[warmup_iters])
 
 warmup_scheduler_adamw = LinearLR(optimizer_adamw, start_factor=0.1, total_iters=warmup_iters)
 main_scheduler_adamw = CosineAnnealingLR(optimizer_adamw, T_max=max_iters - warmup_iters, eta_min=min_lr)
 scheduler_adamw = SequentialLR(optimizer_adamw, [warmup_scheduler_adamw, main_scheduler_adamw], milestones=[warmup_iters])
 
 
-# Wrap with DDP BEFORE compiling (as per TE docs)
-if USE_DDP:
-    model = DDP(model, device_ids=[ddp_local_rank], process_group=data_parallel_group)
-    raw_model = model.module
-else:
-    raw_model = model
 
-# Compile after wrapping with DDP
+# Compile after wrapping with FSDP
 if USE_COMPILE_MODEL:
     model = torch.compile(model,dynamic=False,mode='max-autotune-no-cudagraphs')
 
@@ -380,16 +402,16 @@ def gradscaler_step_adamw():
     scheduler_adamw.step()
     
 def gradscaler_step():
-    gradScaler.step(optimizer_muon)
+    # gradScaler.step(optimizer_muon)
     gradscaler_step_adamw()
-    scheduler_muon.step()
+    # scheduler_muon.step()
     
 def optimizer_zero_grad():
-    optimizer_muon.zero_grad()
+    # optimizer_muon.zero_grad()
     optimizer_adamw.zero_grad()
 
 def gradscaler_unscale():
-    gradScaler.unscale_(optimizer_muon)
+    # gradScaler.unscale_(optimizer_muon)
     gradScaler.unscale_(optimizer_adamw)
 
 
@@ -404,9 +426,7 @@ for iter in range(max_iters):
        
     xb, yb = get_batch('train')
 
-    # Control gradient synchronization for gradient accumulation
-    if USE_DDP: 
-        model.require_backward_grad_sync = ((iter + 1) % grad_accum_steps == 0)       
+    # FSDP handles gradient synchronization automatically
     with torch.amp.autocast('cuda', enabled=USE_AMP, dtype=torch.bfloat16):
         # Use amax_reduction_group for proper FP8 scaling factor synchronization across GPUs (TE best practice)
         with te.autocast(enabled=(USE_FP8 or USE_NVFP4), recipe=recipe, amax_reduction_group=amax_reduction_group):
@@ -463,6 +483,6 @@ for iter in range(max_iters):
 # if master_process:
 #     print(decode(raw_model.generate(context, max_new_tokens=2000)[0].tolist()))
 
-# Clean up DDP
-if USE_DDP:
+# Clean up FSDP
+if USE_FSDP:
     destroy_process_group()
