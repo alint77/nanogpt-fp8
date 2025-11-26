@@ -13,12 +13,12 @@ import os
 
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-from functools import partial
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, MixedPrecision
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.distributed import init_process_group, destroy_process_group
 import torch.distributed as dist
-from transformer_engine.pytorch.distributed import prepare_te_modules_for_fsdp
+
+# FSDP2 imports
+from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.device_mesh import init_device_mesh
 
 
 
@@ -34,13 +34,13 @@ USE_NVFP4 = False
 USE_COMPILE_MODEL = False
 USE_AMP = True
 USE_FP8_WEIGHTS = False
-USE_FSDP = False
-USE_DDP = True  # For clarity
+USE_FSDP2 = False  
+USE_DDP = True  # For clarity - only one of FSDP2, DDP should be True
 
 
 # hyperparameters
-total_batch_size = 524288 # total tokens per batch
-batch_size = 2 # how many independent sequences will we process in parallel?
+total_batch_size = 512000 # total tokens per batch
+batch_size = 40 # how many independent sequences will we process in parallel?
 block_size = 2048 # what is the maximum context length for predictions?
 max_iters = 5000
 print_interval = 20
@@ -73,7 +73,7 @@ if USE_NVFP4:
 else:
     recipe = DelayedScaling()
 
-if USE_FSDP or USE_DDP:
+if USE_DDP or USE_FSDP2:
     init_process_group(backend='nccl')
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
@@ -83,7 +83,11 @@ if USE_FSDP or USE_DDP:
     master_process = ddp_rank == 0 
     seed_offset = ddp_rank 
     data_parallel_group = dist.new_group(backend='nccl')
-    amax_reduction_group = data_parallel_group  
+    amax_reduction_group = data_parallel_group
+    
+    # Initialize device mesh for FSDP2
+    if USE_FSDP2:
+        device_mesh = init_device_mesh("cuda", (ddp_world_size,))
 else:
     master_process = True
     seed_offset = 0
@@ -92,6 +96,7 @@ else:
     amax_reduction_group = None
     ddp_rank = 0
     ddp_local_rank = 0
+    device_mesh = None
 
 grad_accum_steps = max(1, math.ceil(total_batch_size / (batch_size * ddp_world_size*block_size)))
 total_batch_size = batch_size * grad_accum_steps * ddp_world_size * block_size
@@ -176,8 +181,8 @@ class DistributedDataLoader:
             self.advance()
         return x.cuda(), y.cuda()
 
-train_loader = DistributedDataLoader(input_bin, batch_size, block_size, ddp_rank if USE_DDP or USE_FSDP else 0, ddp_world_size if USE_DDP or USE_FSDP else 1)
-val_loader = DistributedDataLoader(input_val_bin, batch_size, block_size, ddp_rank if USE_DDP or USE_FSDP else 0, ddp_world_size if USE_DDP or USE_FSDP else 1)
+train_loader = DistributedDataLoader(input_bin, batch_size, block_size, ddp_rank if USE_DDP or USE_FSDP2 else 0, ddp_world_size if USE_DDP or USE_FSDP2 else 1)
+val_loader = DistributedDataLoader(input_val_bin, batch_size, block_size, ddp_rank if USE_DDP or USE_FSDP2 else 0, ddp_world_size if USE_DDP or USE_FSDP2 else 1)
 if master_process:
     print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
     print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
@@ -311,17 +316,6 @@ with te.quantized_model_init(enabled=USE_FP8_WEIGHTS, recipe=recipe):
 if master_process:
     print(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
 
-hidden_weights = [p for p in model.blocks.parameters() if p.ndim >= 2]
-hidden_gains_biases = [p for p in model.blocks.parameters() if p.ndim < 2]
-nonhidden_params = [*model.token_embedding_table.parameters(),*model.lm_head.parameters(),*model.ln_f.parameters()]
-param_groups = [
-    dict(params=hidden_weights, use_muon=True,
-         lr=0.02, weight_decay=0.01),
-    dict(params=hidden_gains_biases+nonhidden_params, use_muon=False,
-         lr=0.001, betas=(0.9, 0.95), weight_decay=0.01),
-]
-
-
 torch.backends.fp32_precision = "tf32"
 torch.backends.cuda.matmul.fp32_precision = "tf32"
 torch.backends.cudnn.fp32_precision = "tf32"
@@ -332,70 +326,86 @@ torch.backends.cudnn.rnn.fp32_precision = "tf32"
 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
 torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
 
-# Wrap with FSDP BEFORE compiling
-if USE_FSDP:
-    # Use transformer_auto_wrap_policy for TransformerLayer modules
-    fsdp_wrap_policy = partial(
-        transformer_auto_wrap_policy,
-        transformer_layer_cls={te.TransformerLayer}
+# Wrap with FSDP/FSDP2 BEFORE compiling
+if USE_FSDP2:
+    # FSDP2 uses fully_shard() - a composable API
+    # Define mixed precision policy for FSDP2
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,
     )
     
-    model = FSDP(
+    # Apply fully_shard to each TransformerLayer block first (inner sharding)
+    for name, block in model.blocks.items():
+        fully_shard(
+            block,
+            mesh=device_mesh,
+            mp_policy=mp_policy,
+            reshard_after_forward=False,  # Keeps params gathered after forward
+        )
+    
+    # Then apply fully_shard to the entire model (outer sharding)
+    fully_shard(
         model,
-        process_group=data_parallel_group,
-        sharding_strategy=ShardingStrategy.FULL_SHARD,  # Only shard optimizer states and gradients
-        use_orig_params=True,
-        # mixed_precision=MixedPrecision(
-        #     param_dtype=torch.bfloat16,
-        #     reduce_dtype=torch.float32,
-        # ),
-        auto_wrap_policy=fsdp_wrap_policy,
+        mesh=device_mesh,
+        mp_policy=mp_policy,
+        reshard_after_forward=False,  # Keeps params gathered after forward
     )
-    
-    # Prepare TE modules to shard internal buffers that FSDP cannot shard on its own
-    prepare_te_modules_for_fsdp(model)
-    
     raw_model = model
+    if master_process:
+        print(f"FSDP2 enabled with {ddp_world_size} GPUs")
+
 elif USE_DDP:
     model = torch.nn.parallel.DistributedDataParallel(
         model,
         device_ids=[ddp_local_rank],
-        # output_device=ddp_local_rank,
         process_group=data_parallel_group,
-        # broadcast_buffers=False,
-        # static_graph=True,
     )
     raw_model = model.module
 else:
     raw_model = model
 
+# Create param_groups AFTER FSDP2/DDP wrapping to get correct parameter references
+hidden_weights = [p for p in raw_model.blocks.parameters() if p.ndim >= 2]
+hidden_gains_biases = [p for p in raw_model.blocks.parameters() if p.ndim < 2]
+nonhidden_params = [*raw_model.token_embedding_table.parameters(), *raw_model.lm_head.parameters(), *raw_model.ln_f.parameters()]
+param_groups = [
+    dict(params=hidden_weights, use_muon=True,
+         lr=0.02, weight_decay=0.01),
+    dict(params=hidden_gains_biases+nonhidden_params, use_muon=False,
+         lr=0.001, betas=(0.9, 0.95), weight_decay=0.01),
+]
 
-
-
-# optimizer_muon = NorMuon(param_groups[0]['params'],
-#                                     lr=param_groups[0]['lr'],
-#                                     weight_decay=param_groups[0]['weight_decay'])
+if USE_DDP:
+    optimizer_muon = NorMuon(param_groups[0]['params'],
+                            lr=param_groups[0]['lr'],
+                            weight_decay=param_groups[0]['weight_decay'])
+else: #FSDP2 or single GPU 
+    optimizer_muon = SingleDeviceNorMuon(param_groups[0]['params'],
+                                        lr=param_groups[0]['lr'],
+                                        weight_decay=param_groups[0]['weight_decay'])
+    
 
 # optimizer_muon = torch.optim.Muon(param_groups[0]['params'],
 #                                   lr=torch.tensor(param_groups[0]['lr']),
 #                                   weight_decay=param_groups[0]['weight_decay'],)
 
-optimizer_adamw = te.optimizers.FusedAdam(model.parameters(),
+optimizer_adamw = torch.optim.AdamW(param_groups[1]['params'],
                                     lr=torch.tensor(param_groups[1]['lr']),
                                     betas=param_groups[1]['betas'],
                                     weight_decay=param_groups[1]['weight_decay'],
                                     # capturable=True,
                                     # optim_bits=8,
-                                    # fused=True,
+                                    fused=True,
                                     # foreach=True
                                     )
     
 gradScaler = torch.amp.GradScaler(device='cuda', enabled=USE_AMP)
 
 # After creating optimizers:
-# warmup_scheduler_muon = LinearLR(optimizer_muon, start_factor=0.1, total_iters=warmup_iters)
-# main_scheduler_muon = CosineAnnealingLR(optimizer_muon, T_max=max_iters - warmup_iters, eta_min=min_lr)
-# scheduler_muon = SequentialLR(optimizer_muon, [warmup_scheduler_muon, main_scheduler_muon], milestones=[warmup_iters])
+warmup_scheduler_muon = LinearLR(optimizer_muon, start_factor=0.1, total_iters=warmup_iters)
+main_scheduler_muon = CosineAnnealingLR(optimizer_muon, T_max=max_iters - warmup_iters, eta_min=min_lr)
+scheduler_muon = SequentialLR(optimizer_muon, [warmup_scheduler_muon, main_scheduler_muon], milestones=[warmup_iters])
 
 warmup_scheduler_adamw = LinearLR(optimizer_adamw, start_factor=0.1, total_iters=warmup_iters)
 main_scheduler_adamw = CosineAnnealingLR(optimizer_adamw, T_max=max_iters - warmup_iters, eta_min=min_lr)
@@ -405,7 +415,7 @@ scheduler_adamw = SequentialLR(optimizer_adamw, [warmup_scheduler_adamw, main_sc
 
 # Compile after wrapping with FSDP
 if USE_COMPILE_MODEL:
-    model = torch.compile(model,dynamic=False,mode='max-autotune-no-cudagraphs')
+    model = torch.compile(model)
 
 # @torch.compile(dynamic=False)
 def gradscaler_step_adamw():
@@ -413,16 +423,16 @@ def gradscaler_step_adamw():
     scheduler_adamw.step()
     
 def gradscaler_step():
-    # gradScaler.step(optimizer_muon)
+    gradScaler.step(optimizer_muon)
     gradscaler_step_adamw()
-    # scheduler_muon.step()
+    scheduler_muon.step()
     
 def optimizer_zero_grad():
-    # optimizer_muon.zero_grad()
-    optimizer_adamw.zero_grad()
+    optimizer_muon.zero_grad(set_to_none=True)
+    optimizer_adamw.zero_grad(set_to_none=True)
 
 def gradscaler_unscale():
-    # gradScaler.unscale_(optimizer_muon)
+    gradScaler.unscale_(optimizer_muon)
     gradScaler.unscale_(optimizer_adamw)
 
 
@@ -430,14 +440,20 @@ t0 = time.time()
 total_training_time = 0  # Track total time (excluding first few iterations)
 tlast = t0
 grad_norm = 0.0  # Track gradient norm for logging
+last_print_iter = 0  # Track which iteration we last printed at
 for iter in range(max_iters):
     t1 = time.time()
-    should_print = iter % print_interval == 0 or iter == max_iters - 1
+    # Skip printing at iter=0 to avoid incorrect token counting (only 1 iter done, but would count as print_interval)
+    should_print = (iter > 0 and iter % print_interval == 0) or iter == max_iters - 1
     
        
     xb, yb = get_batch('train')
-    if USE_DDP: 
-        model.require_backward_grad_sync = ((iter + 1) % grad_accum_steps == 0)  
+    if USE_DDP:
+        model.require_backward_grad_sync = ((iter + 1) % grad_accum_steps == 0)
+    
+    # FSDP2 handles gradient sync automatically but we can use set_requires_gradient_sync for efficiency
+    if USE_FSDP2:
+        model.set_requires_gradient_sync((iter + 1) % grad_accum_steps == 0)  
         
     # FSDP handles gradient synchronization automatically
     with torch.amp.autocast('cuda', enabled=USE_AMP, dtype=torch.bfloat16):
@@ -452,11 +468,7 @@ for iter in range(max_iters):
     if (iter + 1) % grad_accum_steps == 0:
         # Unscale gradients before clipping
         gradscaler_unscale()
-        if USE_FSDP:
-        # Get gradient norm before clipping
-            grad_norm = model.clip_grad_norm_( max_norm=1.0)
-        if USE_DDP: 
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         gradscaler_step()
         gradScaler.update()
         
@@ -472,7 +484,9 @@ for iter in range(max_iters):
         t2 = time.time()
         dt = t2 - tlast 
         
-        tokens_per_iteration = batch_size * block_size * print_interval * ddp_world_size
+        # Calculate actual iterations since last print (handles max_iters-1 case correctly)
+        iters_since_last_print = iter - last_print_iter
+        tokens_per_iteration = batch_size * block_size * iters_since_last_print * ddp_world_size
         tok_per_sec = int(tokens_per_iteration / dt)
         
         print(f"step {iter}: train loss {loss.detach():.4f}")
@@ -481,10 +495,13 @@ for iter in range(max_iters):
         print(f"total time: {total_training_time/60:.2f} min")
         free, total = torch.cuda.mem_get_info(device)
         mem_used_GB = (total - free) / 1024 ** 3
-        print(f"grad norm: {grad_norm:.4f}")
+        # Convert DTensor to regular tensor for FSDP2
+        grad_norm_value = grad_norm.item() if hasattr(grad_norm, 'item') else float(grad_norm)
+        print(f"grad norm: {grad_norm_value:.4f}")
         print(f"{mem_used_GB:.2f} GB used")
         print('------------')
         tlast = time.time()
+        last_print_iter = iter  # Update for next tokens/sec calculation
     if iter % eval_interval == 0 and iter > 0 and master_process:
         # Reuse training batch tensors for evaluation to save VRAM
         losses = estimate_loss(reuse_input=xb, reuse_target=yb)
@@ -497,6 +514,6 @@ for iter in range(max_iters):
 # if master_process:
 #     print(decode(raw_model.generate(context, max_new_tokens=2000)[0].tolist()))
 
-# Clean up FSDP
-if USE_FSDP:
+# Clean up distributed
+if USE_DDP or USE_FSDP2:
     destroy_process_group()
