@@ -2,7 +2,9 @@ torch
 datasets 
 tqdm 
 buildtools 
-transformer_engine[pytorch] 
+setuptools
 bitsandbytes
 wandb
--e git://github.com/microsoft/dion.git
+dion @ git+https://github.com/microsoft/dion.git
+--extra-index-url https://pypi.nvidia.com/ 
+transformer_engine[pytorch] 
