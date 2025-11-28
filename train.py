@@ -34,6 +34,7 @@ USE_WANDB = True
 WANDB_PROJECT = "nanogpt-fp8"
 WANDB_RUN_NAME = None  # Set to None for auto-generated name
 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # hyperparameters
 total_batch_size = 512000 # total tokens per batch
@@ -293,7 +294,7 @@ class LLM(nn.Module):
             num_attention_heads=n_head,
             attn_input_format='bshd',  # Critical: our input is (batch, seq, hidden)
             bias=False,
-            qk_norm_type='RMSNorm',
+            qk_norm_type='L2Normalization',
             normalization="RMSNorm",
             fuse_qkv_params=True,
             seq_length=block_size,
@@ -304,7 +305,7 @@ class LLM(nn.Module):
             
         ) for i in range(n_layer)}) 
         self.ln_f = te.RMSNorm(n_embd) # final layer norm
-        self.lm_head = nn.Linear(n_embd, vocab_size,bias=False)
+        self.lm_head = te.Linear(n_embd, vocab_size,bias=False)
         # self.token_embedding_table.weight = self.lm_head.weight # tie weights
     
     def forward(self, idx, targets=None,is_first_microbatch= False):
@@ -387,7 +388,7 @@ if USE_FSDP2:
             block,
             mesh=device_mesh,
             mp_policy=mp_policy,
-            reshard_after_forward=False,  # Keeps params gathered after forward
+            reshard_after_forward=True,  # Keeps params gathered after forward
         )
     
     # Then apply fully_shard to the entire model (outer sharding)
@@ -395,7 +396,7 @@ if USE_FSDP2:
         model,
         mesh=device_mesh,
         mp_policy=mp_policy,
-        reshard_after_forward=False,  # Keeps params gathered after forward
+        reshard_after_forward=True,  # Keeps params gathered after forward
     )
     raw_model = model
     print0(f"FSDP2 enabled with {ddp_world_size} GPUs")
@@ -457,8 +458,6 @@ optimizer_adamw_unembedding = torch.optim.AdamW(param_groups[2]['params'],
                                     fused=True,
                                     # foreach=True
                                     )
-    
-gradScaler = torch.amp.GradScaler(device='cuda', enabled=USE_AMP)
 
 # After creating optimizers:
 warmup_scheduler_muon = LinearLR(optimizer_muon, start_factor=0.1, total_iters=warmup_iters)
@@ -475,29 +474,20 @@ scheduler_adamw_unembedding = SequentialLR(optimizer_adamw_unembedding, [warmup_
 
 # Compile after wrapping with FSDP
 if USE_COMPILE_MODEL:
-    model = torch.compile(model,mode="max-autotune-no-cudagraphs")
+    model = torch.compile(model)
 
-# @torch.compile(dynamic=False)
-def gradscaler_step_adamw():
-    gradScaler.step(optimizer_adamw_embedding)
-    scheduler_adamw_embedding.step()
-    gradScaler.step(optimizer_adamw_unembedding)
-    scheduler_adamw_unembedding.step()
-    
-def gradscaler_step():
-    gradScaler.step(optimizer_muon)
-    gradscaler_step_adamw()
+def optimizer_step():
+    optimizer_muon.step()
     scheduler_muon.step()
+    optimizer_adamw_embedding.step()
+    scheduler_adamw_embedding.step()
+    optimizer_adamw_unembedding.step()
+    scheduler_adamw_unembedding.step()
     
 def optimizer_zero_grad():
     optimizer_muon.zero_grad(set_to_none=True)
     optimizer_adamw_embedding.zero_grad(set_to_none=True)
     optimizer_adamw_unembedding.zero_grad(set_to_none=True)
-
-def gradscaler_unscale():
-    gradScaler.unscale_(optimizer_muon)
-    gradScaler.unscale_(optimizer_adamw_embedding)
-    gradScaler.unscale_(optimizer_adamw_unembedding)
 
 t0 = time.time()  
 total_training_time = 0  # Track total time (excluding first few iterations)
@@ -526,15 +516,11 @@ for iter in range(max_iters):
     
     # Scale loss for gradient accumulation
     scaled_loss = loss / grad_accum_steps
-    gradScaler.scale(scaled_loss).backward()
+    scaled_loss.backward()
     
     if (iter + 1) % grad_accum_steps == 0:
-        # Unscale gradients before clipping
-        gradscaler_unscale()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        gradscaler_step()
-        gradScaler.update()
-        
+        optimizer_step()
         optimizer_zero_grad()
     
     
