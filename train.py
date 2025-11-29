@@ -29,9 +29,9 @@ USE_NVFP4 = False
 USE_COMPILE_MODEL = False
 USE_AMP = True
 USE_FP8_WEIGHTS = False # TODO: currently not supported
-USE_FSDP2 = True  
-USE_DDP = False  # For clarity - only one of FSDP2, DDP should be True
-USE_AC_LM_HEAD = True  # Enable activation checkpointing for lm_head
+USE_FSDP2 = False  
+USE_DDP = True  # For clarity - only one of FSDP2, DDP should be True
+USE_AC_LM_HEAD = False  # Enable activation checkpointing for lm_head
 
 # Wandb logging
 USE_WANDB = True
@@ -41,7 +41,7 @@ WANDB_RUN_NAME = None  # Set to None for auto-generated name
 
 # hyperparameters
 total_batch_size = 512000 # total tokens per batch
-batch_size = 8 # how many independent sequences will we process in parallel?
+batch_size = 32 # how many independent sequences will we process in parallel?
 block_size = 2048 # what is the maximum context length for predictions?
 max_iters = 5000
 learning_rate = 1e-3
@@ -502,7 +502,17 @@ scheduler_adamw_unembedding = SequentialLR(optimizer_adamw_unembedding, [warmup_
 if USE_COMPILE_MODEL:
     model = torch.compile(model)
 
-def optimizer_step():
+# Momentum scheduler for Muon optimizer (copied from Karpathy's nanochat)
+def get_muon_momentum(it):
+    frac = min(it / 300, 1)
+    momentum = (1 - frac) * 0.85 + frac * 0.95
+    return momentum
+
+def optimizer_step(step=None):
+    
+    for group in optimizer_muon.param_groups:
+        group["momentum"] = get_muon_momentum(step)
+    
     optimizer_muon.step()
     scheduler_muon.step()
     optimizer_adamw_embedding.step()
@@ -525,6 +535,7 @@ for iter in range(max_iters):
     # Skip printing at iter=0 to avoid incorrect token counting (only 1 iter done, but would count as print_interval)
     should_print = (iter > 0 and iter % print_interval == 0) or iter == max_iters - 1
     
+    step = iter // grad_accum_steps
        
     xb, yb = get_batch('train')
     if USE_DDP:
@@ -546,7 +557,7 @@ for iter in range(max_iters):
     
     if (iter + 1) % grad_accum_steps == 0:
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer_step()
+        optimizer_step(step)
         optimizer_zero_grad()
     
     
@@ -564,7 +575,7 @@ for iter in range(max_iters):
         tokens_per_iteration = batch_size * block_size * iters_since_last_print * ddp_world_size
         tok_per_sec = int(tokens_per_iteration / dt)
         
-        print(f"step {iter//grad_accum_steps}: train loss {loss.detach():.4f}")
+        print(f"step {step}: train loss {loss.detach():.4f}")
         print(f"iter time: {dt:.4f}s | tok/sec: {tok_per_sec:,}")
         print(f"lr: Muon:{scheduler_muon.get_last_lr()[0]:.6f}, AdamW Embd: {scheduler_adamw_embedding.get_last_lr()[0]:.6f}, AdamW LM_head: {scheduler_adamw_unembedding.get_last_lr()[0]:.6f}")  # Add this line
         print(f"total time: {total_training_time/60:.2f} min")
@@ -595,7 +606,7 @@ for iter in range(max_iters):
                 "lr/adamw_embedding": scheduler_adamw_embedding.get_last_lr()[0],
                 "lr/adamw_unembedding": scheduler_adamw_unembedding.get_last_lr()[0],
                 "system/gpu_memory_gb": mem_used_GB,
-            }, step=iter//grad_accum_steps)
+            }, step=step)
         
         tlast = time.time()
         last_print_iter = iter  # Update for next tokens/sec calculation
@@ -603,7 +614,7 @@ for iter in range(max_iters):
         # Reuse training batch tensors for evaluation to save VRAM
         losses = estimate_loss(reuse_input=xb, reuse_target=yb)
         print0('---- eval ----')
-        print0(f"step {iter//grad_accum_steps}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print0(f"step {step}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         print0('------------')
         
         # Log eval metrics to wandb
@@ -611,7 +622,7 @@ for iter in range(max_iters):
             wandb.log({
                 "eval/train_loss": losses['train'],
                 "eval/val_loss": losses['val'],
-            }, step=iter//grad_accum_steps)
+            }, step=step)
 
 # Finish wandb run
 if USE_WANDB and master_process:
