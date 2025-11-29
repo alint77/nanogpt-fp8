@@ -237,44 +237,26 @@ def get_batch(split):
         return val_loader.next_batch()
 
 @torch.no_grad()
-def estimate_loss(reuse_input=None, reuse_target=None):
+def estimate_loss():
     """
-    Memory-efficient evaluation that runs at batch size 1.
-    Uses a slice of the provided tensors or allocates a batch-size-1 tensor.
+    Evaluate on validation data only (don't consume training data).
     """
-    out = {}
     model.eval()
+    val_loader.reset()
     
-    # Always use batch size 1 for evaluation to minimize VRAM
-    eval_batch_size = 1
-    
-    # Determine if we can reuse a slice of training tensors or need to allocate
-    if reuse_input is not None and reuse_target is not None:
-        # Use only the first element (batch size 1) of the training tensors
-        eval_input = reuse_input[:eval_batch_size]  # Shape: (1, block_size)
-        eval_target = reuse_target[:eval_batch_size]  # Shape: (1, block_size)
-    else:
-        # Fallback: allocate batch-size-1 tensors
-        eval_input = torch.empty((eval_batch_size, block_size), dtype=torch.long, device=device)
-        eval_target = torch.empty((eval_batch_size, block_size), dtype=torch.long, device=device)
-    
-    for split in ['train', 'val']:
-        loss_sum = 0.0  
-        for _ in range(eval_iters):
-            
-            x, y = get_batch(split)
-            eval_input.copy_(x[:eval_batch_size], non_blocking=True)
-            eval_target.copy_(y[:eval_batch_size], non_blocking=True)
-            
-            with torch.amp.autocast('cuda', enabled=USE_AMP, dtype=torch.bfloat16),te.autocast(enabled=(USE_FP8 or USE_NVFP4), recipe=recipe, amax_reduction_group=data_parallel_group):
-                _, loss = raw_model(eval_input, eval_target)
-            
-            loss_sum += loss.item()
+    loss_sum = 0.0  
+    for _ in range(eval_iters):
+        x, y = val_loader.next_batch()
         
-        out[split] = loss_sum / eval_iters
+        with torch.amp.autocast('cuda', enabled=USE_AMP, dtype=torch.bfloat16), te.autocast(enabled=(USE_FP8 or USE_NVFP4), recipe=recipe, amax_reduction_group=data_parallel_group):
+            _, loss = raw_model(x, y)
+        
+        loss_sum += loss.item()
+    
+    val_loss = loss_sum / eval_iters
     
     model.train()
-    return out
+    return val_loss
 
 
 # Custom init functions for TE TransformerLayer (following https://arxiv.org/pdf/2310.17813)
@@ -312,7 +294,7 @@ class LLM(nn.Module):
             bias=False,
             qk_norm_type='L2Normalization',
             normalization="RMSNorm",
-            fuse_qkv_params=True,
+            fuse_qkv_params=False, #HAS TO BE FALSE IF USING MUON OTHERWISE WONT CONVERGE PROPERLY
             seq_length=block_size,
             micro_batch_size=batch_size,
             init_method=te_init_method,
@@ -577,6 +559,9 @@ last_print_iter = 0  # Track which iteration we last printed at
 torch.cuda.synchronize()
 tlast = time.time()  # Initialize after first sync for accurate first interval
 
+# Reset train loader before training
+train_loader.reset()
+
 for iter in range(max_iters):
     # Skip printing at iter=0 to avoid incorrect token counting (only 1 iter done, but would count as print_interval)
     should_print = (iter > 0 and iter % print_interval == 0) or iter == max_iters - 1
@@ -666,8 +651,8 @@ for iter in range(max_iters):
         tlast = time.time()
         last_print_iter = iter  # Update for next tokens/sec calculation
     if iter % eval_interval == 0 and iter > 0:
-        # Reuse training batch tensors for evaluation to save VRAM
-        losses = estimate_loss(reuse_input=xb, reuse_target=yb)
+        # Evaluate on validation data only
+        val_loss = estimate_loss()
         
         # Compute logit statistics during eval (no perf impact since we're already syncing)
         model.eval()
@@ -685,7 +670,7 @@ for iter in range(max_iters):
         model.train()
         
         print0('---- eval ----')
-        print0(f"step {step}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print0(f"step {step}: val loss {val_loss:.4f}")
         if logit_stats is not None:
             print0(f"logits: max={logit_stats['max']:.2f}, min={logit_stats['min']:.2f}, mean={logit_stats['mean']:.4f}, std={logit_stats['std']:.4f}")
         print0('------------')
@@ -693,8 +678,7 @@ for iter in range(max_iters):
         # Log eval metrics to wandb
         if USE_WANDB and master_process:
             log_dict = {
-                "eval/train_loss": losses['train'],
-                "eval/val_loss": losses['val'],
+                "eval/val_loss": val_loss,
             }
             if logit_stats is not None:
                 log_dict.update({
