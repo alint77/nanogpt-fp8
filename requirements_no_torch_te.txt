@@ -1,0 +1,10 @@
+# torch 
+datasets 
+tqdm 
+buildtools 
+setuptools
+wandb
+ninja
+dion @ git+https://github.com/microsoft/dion.git
+# --extra-index-url https://pypi.nvidia.com/ 
+# transformer_engine[pytorch] 
