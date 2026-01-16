@@ -5,6 +5,6 @@ buildtools
 setuptools
 wandb
 ninja
-dion @ git+https://github.com/microsoft/dion.git
+dion @ git+https://github.com/alint77/dion@fix/normuon-zero-gradient-nan
 # --extra-index-url https://pypi.nvidia.com/ 
 # transformer_engine[pytorch] 

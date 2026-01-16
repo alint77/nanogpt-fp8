@@ -38,7 +38,7 @@ WANDB_RUN_NAME = None  # Set to None for auto-generated name
 
 
 # hyperparameters
-total_batch_size = 512000 # total tokens per batch
+total_batch_size = 524288 # total tokens per batch
 batch_size = 6 # how many independent sequences will we process in parallel?
 block_size = 2048 # what is the maximum context length for predictions?
 max_iters = 5000
@@ -467,9 +467,11 @@ param_groups = [
 
 from dion import Muon,NorMuon,Dion2,Dion
 
-optimizer_muon = Muon(param_groups,
+optimizer_muon = NorMuon(param_groups,
                         distributed_mesh=device_mesh if (USE_FSDP2) else data_parallel_group if (USE_DDP) else None,
                         use_triton=True, 
+                        weight_decay=0.01,
+                        cautious_wd=True,
                         )
 
     
