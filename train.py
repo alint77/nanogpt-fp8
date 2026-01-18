@@ -30,6 +30,10 @@ USE_FP8_WEIGHTS = False # TODO: currently not supported
 USE_FSDP2 = True  
 USE_DDP = False  # For clarity - only one of FSDP2, DDP should be True
 USE_AC_LM_HEAD = False  # Enable activation checkpointing for lm_head
+USE_AC_BLOCKS = False # Enable activation checkpointing for transformer blocks
+USE_AC_ATTENTION = False  # Enable activation checkpointing for attention core (inside transformer blocks)
+USE_FAST_FSDP = True  # If True, use reshard_after_forward=False to keep params gathered after forward
+USE_DOC_MASK = True  # Enable document-separated attention (prevents cross-document attention)
 
 # Wandb logging
 USE_WANDB = True
@@ -39,17 +43,17 @@ WANDB_RUN_NAME = None  # Set to None for auto-generated name
 
 # hyperparameters
 total_batch_size = 524288 # total tokens per batch
-batch_size = 6 # how many independent sequences will we process in parallel?
-block_size = 2048 # what is the maximum context length for predictions?
+batch_size = 16 # how many independent sequences will we process in parallel?
+block_size = 1024 # what is the maximum context length for predictions?
 max_iters = 5000
 learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 50
-n_layer = 20
+n_layer = 12
 n_embd = n_layer*64
 n_head = max(1, (n_embd + 127) // 128)
 dropout = 0.0
-vocab_size = 65536
+vocab_size = 50304
 dataset = 'openwebtext-1M'  # name of the dataset subdirectory in ./data/
 input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
 input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
@@ -138,6 +142,9 @@ if USE_WANDB and master_process:
         "use_amp": USE_AMP,
         "use_fsdp2": USE_FSDP2,
         "use_ddp": USE_DDP,
+        "use_ac_lm_head": USE_AC_LM_HEAD,
+        "use_ac_blocks": USE_AC_BLOCKS,
+        "use_doc_mask": USE_DOC_MASK,
         "world_size": ddp_world_size,
     }
     wandb.init(
@@ -220,7 +227,65 @@ class DistributedDataLoader:
         self.current_position += B * T * self.num_processes
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.advance()
-        return x.cuda(), y.cuda()
+        
+        # Compute document boundaries for document-separated attention
+        # EOT token (50256 for GPT-2) marks document boundaries
+        cu_seqlens = None
+        if USE_DOC_MASK:
+            cu_seqlens = self._compute_cu_seqlens(x)
+        
+        return x.cuda(), y.cuda(), cu_seqlens
+    
+    def _compute_cu_seqlens(self, x):
+        """
+        Compute cumulative sequence lengths for document-separated attention.
+        
+        For each sequence in the batch, find EOT tokens (50256) which mark
+        document boundaries. Returns cu_seqlens tensor for use with TE's
+        padding_causal mask.
+        
+        Args:
+            x: Input tensor of shape (B, T)
+        
+        Returns:
+            cu_seqlens: Tensor of shape (B, max_seqs+1) with cumulative lengths,
+                       padded with -1 for sequences with fewer documents.
+                       Returns None if no EOT tokens found.
+        """
+        B, T = x.shape
+        EOT_TOKEN = 50256  # GPT-2 EOT token
+        
+        # Find all EOT positions in each sequence
+        # cu_seqlens format: [0, end1, end2, ..., T] for each sequence
+        cu_seqlens_list = []
+        max_seqs = 1  # Track max number of sequences for padding
+        
+        for b in range(B):
+            # Find EOT positions in this sequence
+            eot_positions = (x[b] == EOT_TOKEN).nonzero(as_tuple=True)[0]
+            
+            # Build cumulative sequence lengths
+            # Start with 0, then position after each EOT, end with T
+            cu_seq = [0]
+            for pos in eot_positions:
+                # The document ends at pos (inclusive), next starts at pos+1
+                cu_seq.append(pos.item() + 1)
+            # Always end with T (handles case where last doc doesn't end with EOT)
+            if cu_seq[-1] != T:
+                cu_seq.append(T)
+            
+            cu_seqlens_list.append(cu_seq)
+            max_seqs = max(max_seqs, len(cu_seq))
+        
+        # Pad all cu_seqlens to same length and convert to tensor
+        # Use T as padding value (safe since it's a valid end position)
+        cu_seqlens_padded = []
+        for cu_seq in cu_seqlens_list:
+            padded = cu_seq + [cu_seq[-1]] * (max_seqs - len(cu_seq))
+            cu_seqlens_padded.append(padded)
+        
+        cu_seqlens = torch.tensor(cu_seqlens_padded, dtype=torch.int32)
+        return cu_seqlens.cuda()
 
 train_loader = DistributedDataLoader(input_bin, batch_size, block_size, ddp_rank if USE_DDP or USE_FSDP2 else 0, ddp_world_size if USE_DDP or USE_FSDP2 else 1)
 val_loader = DistributedDataLoader(input_val_bin, batch_size, block_size, ddp_rank if USE_DDP or USE_FSDP2 else 0, ddp_world_size if USE_DDP or USE_FSDP2 else 1)
@@ -235,6 +300,46 @@ def get_batch(split):
     else:
         return val_loader.next_batch()
 
+def cu_seqlens_to_attention_mask(cu_seqlens, T, device):
+    """
+    Convert cumulative sequence lengths to an attention mask for document separation.
+    
+    This creates a block-diagonal causal mask where tokens can only attend to
+    tokens within the same document (defined by cu_seqlens boundaries).
+    
+    Args:
+        cu_seqlens: Tensor of shape (B, num_docs+1) with cumulative positions
+        T: Sequence length
+        device: Device to create mask on
+    
+    Returns:
+        attention_mask: Tensor of shape (B, 1, 1, T) for use with TE attention
+    """
+    B = cu_seqlens.shape[0]
+    # Create position indices
+    positions = torch.arange(T, device=device)
+    
+    # For each position, find which document it belongs to
+    # A position p belongs to document d if cu_seqlens[d] <= p < cu_seqlens[d+1]
+    # We create a mask where True means the position should be masked (not attended to)
+    
+    # Simple approach: create per-sample masks
+    masks = []
+    for b in range(B):
+        cu_seq = cu_seqlens[b]
+        # Find valid boundaries (non-padded)
+        valid_mask = torch.zeros(T, device=device, dtype=torch.bool)
+        # Mark positions that are within document boundaries
+        for i in range(len(cu_seq) - 1):
+            start, end = cu_seq[i].item(), cu_seq[i + 1].item()
+            if start >= end or start >= T:
+                break
+            valid_mask[start:min(end, T)] = True
+        masks.append(~valid_mask)  # True = masked out
+    
+    attention_mask = torch.stack(masks).unsqueeze(1).unsqueeze(1)  # (B, 1, 1, T)
+    return attention_mask
+
 @torch.no_grad()
 def estimate_loss():
     """
@@ -245,10 +350,10 @@ def estimate_loss():
     
     loss_sum = 0.0  
     for _ in range(eval_iters):
-        x, y = val_loader.next_batch()
+        x, y, cu_seqlens = val_loader.next_batch()
         
         with torch.amp.autocast('cuda', enabled=USE_AMP, dtype=torch.bfloat16), te.autocast(enabled=(USE_FP8 or USE_NVFP4), recipe=recipe, amax_reduction_group=data_parallel_group):
-            _, loss = raw_model(x, y)
+            _, loss = raw_model(x, y, cu_seqlens=cu_seqlens)
         
         loss_sum += loss.item()
     
@@ -345,24 +450,42 @@ class LLM(nn.Module):
         # Only return loss - returning logits would defeat the purpose of checkpointing
         # since they'd need to be saved for backward anyway
         return loss
-    def forward(self, idx, targets=None,is_first_microbatch= False):
+
+    def _run_block(self, block, x, rotary_pos_emb, is_first_microbatch, attention_mask=None):
+        # Use padding_causal when we have document boundaries, otherwise standard causal
+        mask_type = "padding_causal" if attention_mask is not None else "causal"
+        return block(x, rotary_pos_emb=rotary_pos_emb,
+                        self_attn_mask_type=mask_type,
+                        attention_mask=attention_mask,
+                        is_first_microbatch = is_first_microbatch,
+                        checkpoint_core_attention=USE_AC_ATTENTION)
+
+    def forward(self, idx, targets=None, is_first_microbatch=False, cu_seqlens=None):
         B, T = idx.shape
         rotary_pos_emb = self.rope(T)  # Shape: (T, 1, 1, head_dim)
         # idx and targets are both (B,T) tensor of integers
         x = self.token_embedding_table(idx) # (B,T,C)
         # pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
+        
+        # Create attention mask for document-separated attention if cu_seqlens provided
+        attention_mask = None
+        if cu_seqlens is not None:
+            attention_mask = cu_seqlens_to_attention_mask(cu_seqlens, T, x.device)
+        
         for i in range(n_layer):
-            x = self.blocks[f"block_{i}"](x, rotary_pos_emb=rotary_pos_emb,
-                                          self_attn_mask_type="causal",
-                                          is_first_microbatch = is_first_microbatch,
-                                          checkpoint_core_attention=False)  # (B,T,C)
+            block = self.blocks[f"block_{i}"]
+            if USE_AC_BLOCKS:
+                x = te.checkpoint(self._run_block, block, x, rotary_pos_emb, is_first_microbatch, attention_mask, use_reentrant=True)
+            else:
+                x = self._run_block(block, x, rotary_pos_emb, is_first_microbatch, attention_mask)
+                
         x = self.ln_f(x) # (B,T,C)
 
         # Apply activation checkpointing to lm_head + loss if enabled
         # This saves memory by NOT storing the large (B*T, vocab_size) logits tensor
         # Instead, we recompute lm_head during backward pass
         if USE_AC_LM_HEAD and self.training and targets is not None:
-            loss = te.checkpoint(self._lm_head_with_loss, x, targets, use_reentrant=False)
+            loss = te.checkpoint(self._lm_head_with_loss, x, targets, use_reentrant=True)
             logits = None  # Don't compute logits separately during training with AC
         else:
             logits = self.lm_head(x)  # (B,T,vocab_size)
@@ -425,12 +548,12 @@ if USE_FSDP2:
             block,
             mesh=device_mesh,
             mp_policy=mp_policy,
-            reshard_after_forward=False,  # Keeps params gathered after forward
+            reshard_after_forward=(not USE_FAST_FSDP),  # Keeps params gathered after forward
         )
     fully_shard(model.lm_head,
         mesh=device_mesh,
         mp_policy=mp_policy,
-        reshard_after_forward=False,  # Keeps params gathered after forward
+        reshard_after_forward=(not USE_FAST_FSDP),  # Keeps params gathered after forward
     )
     
     # Then apply fully_shard to the entire model (outer sharding)
@@ -438,7 +561,7 @@ if USE_FSDP2:
         model,
         mesh=device_mesh,
         mp_policy=mp_policy,
-        reshard_after_forward=False,  # Keeps params gathered after forward
+        reshard_after_forward=(not USE_FAST_FSDP),  # Keeps params gathered after forward
     )
     raw_model = model
     print0(f"FSDP2 enabled with {ddp_world_size} GPUs")
@@ -518,7 +641,7 @@ for iter in range(max_iters):
     
     step = iter // grad_accum_steps
        
-    xb, yb = get_batch('train')
+    xb, yb, cu_seqlens = get_batch('train')
     if USE_DDP:
         model.require_backward_grad_sync = ((iter + 1) % grad_accum_steps == 0)
     
@@ -530,7 +653,7 @@ for iter in range(max_iters):
     with torch.amp.autocast('cuda', enabled=USE_AMP, dtype=torch.bfloat16):
         
         with te.autocast(enabled=(USE_FP8 or USE_NVFP4), recipe=recipe, amax_reduction_group=data_parallel_group):
-            _, loss = model(xb, yb, is_first_microbatch=(iter % grad_accum_steps == 0))
+            _, loss = model(xb, yb, is_first_microbatch=(iter % grad_accum_steps == 0), cu_seqlens=cu_seqlens)
     
     # Scale loss for gradient accumulation
     scaled_loss = loss / grad_accum_steps
@@ -607,7 +730,9 @@ for iter in range(max_iters):
         # Compute logit statistics during eval (no perf impact since we're already syncing)
         model.eval()
         with torch.no_grad(), torch.amp.autocast('cuda', enabled=USE_AMP, dtype=torch.bfloat16), te.autocast(enabled=(USE_FP8 or USE_NVFP4), recipe=recipe, amax_reduction_group=data_parallel_group):
-            logits, _ = raw_model(xb[:1], yb[:1])  # Use batch size 1 for stats
+            # Pass cu_seqlens for document-separated attention if enabled
+            cu_seqlens_single = cu_seqlens[:1] if cu_seqlens is not None else None
+            logits, _ = raw_model(xb[:1], yb[:1], cu_seqlens=cu_seqlens_single)  # Use batch size 1 for stats
             if logits is not None:
                 logit_stats = {
                     'max': logits.max().item(),
