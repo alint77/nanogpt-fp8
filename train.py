@@ -27,13 +27,13 @@ USE_NVFP4 = False
 USE_COMPILE_MODEL = False
 USE_AMP = True
 USE_FP8_WEIGHTS = False # TODO: currently not supported
-USE_FSDP2 = True  
-USE_DDP = False  # For clarity - only one of FSDP2, DDP should be True
+USE_FSDP2 = False  
+USE_DDP = True  # For clarity - only one of FSDP2, DDP should be True
 USE_AC_LM_HEAD = False  # Enable activation checkpointing for lm_head
-USE_AC_BLOCKS = False # Enable activation checkpointing for transformer blocks
+USE_AC_BLOCKS = True # Enable activation checkpointing for transformer blocks
 USE_AC_ATTENTION = False  # Enable activation checkpointing for attention core (inside transformer blocks)
 USE_FAST_FSDP = True  # If True, use reshard_after_forward=False to keep params gathered after forward
-USE_DOC_MASK = True  # Enable document-separated attention (prevents cross-document attention)
+USE_DOC_MASK = False  # Enable document-separated attention (prevents cross-document attention)
 
 # Wandb logging
 USE_WANDB = True
@@ -43,7 +43,7 @@ WANDB_RUN_NAME = None  # Set to None for auto-generated name
 
 # hyperparameters
 total_batch_size = 524288 # total tokens per batch
-batch_size = 16 # how many independent sequences will we process in parallel?
+batch_size = 64 # how many independent sequences will we process in parallel?
 block_size = 1024 # what is the maximum context length for predictions?
 max_iters = 5000
 learning_rate = 1e-3
@@ -372,8 +372,16 @@ def te_init_method(weight):
     torch.nn.init.normal_(weight, mean=0.0, std=std)
 
 def te_output_layer_init_method(weight):
-    """Init for PROJ and FC2 weights in TE TransformerLayer - zeroed out."""
-    torch.nn.init.zeros_(weight)
+    """Init for PROJ and FC2 weights. 
+    NOTE: Modified for SSO compatibility.
+    Original Zero Init causes undefined direction on the spectral sphere (Norm=0 -> Scale=Inf).
+    We must use Spectral MuP init (same as te_init_method) to start ON the sphere.
+    """
+    # Use standard Spectral MuP init
+    fan_out = weight.size(0)
+    fan_in = weight.size(1)
+    std = 1.0 / math.sqrt(fan_in) * min(1.0, math.sqrt(fan_out / fan_in))
+    torch.nn.init.normal_(weight, mean=0.0, std=std)
 
 
 class LLM(nn.Module):
@@ -398,7 +406,7 @@ class LLM(nn.Module):
             bias=False,
             qk_norm_type="RMSNorm", # L2 normalization degrades stability
             normalization="RMSNorm",
-            fuse_qkv_params=True,
+            fuse_qkv_params=False,
             seq_length=block_size,
             micro_batch_size=batch_size,
             init_method=te_init_method,
@@ -589,41 +597,77 @@ param_groups = [
 ]
 
 from dion import Muon,NorMuon,Dion2,Dion
+from sso import SSO
 
-optimizer_muon = NorMuon(param_groups,
-                        distributed_mesh=device_mesh if (USE_FSDP2) else data_parallel_group if (USE_DDP) else None,
-                        use_triton=True, 
-                        weight_decay=0.01,
-                        cautious_wd=True,
-                        )
+# Separate optimizers: SSO for 2D hidden weights, AdamW for others
+# Note: Using hyperparameters from Megatron script spball_1.8B_mupinit_muplr5e-3_wd0.1_hard_headfc1split.sh
+# Excluding LR as requested.
+USE_SSO = True
+# SSO Optimizer
+
+if USE_SSO:
+    optimizer_sso = SSO(
+        hidden_weights,
+        lr=0.02,                   # User provided
+        momentum_beta=0.9,         # Script: 0.9
+        weight_decay=0.0,          # Script: Linear weights have 0.0 decay in Megatron implementation of SSO
+        use_nesterov=True,         # Script: --spectral-ball-use-nesterov
+        msign_steps=8,             # Script: 8
+        radius_mode="spectral_mup",# Script: spectral_mup
+        scale_mode="spectral_mup", # Script: spectral_mup
+        solver="bisection",        # Script: bisection
+        solver_tolerance_f=2e-4,   # Script: 2e-4
+        power_iteration_steps=100, # Script: 100
+        solver_max_iterations=20,  # Script: 20
+        retract_mode="hard"        # Script: hard
+    )
+else:
+    optimizer_sso = NorMuon(
+        hidden_weights,
+        distributed_mesh=device_mesh if (USE_FSDP2) else data_parallel_group if (USE_DDP) else None,
+        lr=0.02,                   
+        weight_decay=0.01,   
+        cautious_wd= True,
+        use_triton=True,
+        mu=0.9
+    )
+
+
+# AdamW Optimizer for other parameters (embeddings, norms, biases, head)
+optimizer_adamw = torch.optim.AdamW([
+    dict(params=hidden_gains_biases+nonhidden_params, lr=0.2, betas=(0.9, 0.95), weight_decay=0.01),
+    dict(params=unembedding_params, lr=0.004, betas=(0.9, 0.95), weight_decay=0.01)
+],fused=True)
 
     
 T_max = (max_iters - warmup_iters)//2
-# After creating optimizers:
-warmup_scheduler_muon = LinearLR(optimizer_muon, start_factor=0.1, total_iters=warmup_iters)
-main_scheduler_muon = CosineAnnealingLR(optimizer_muon, T_max=T_max, eta_min=min_lr)
-scheduler_muon = SequentialLR(optimizer_muon, [warmup_scheduler_muon, main_scheduler_muon], milestones=[warmup_iters])
+
+# Schedulers for SSO
+warmup_scheduler_sso = LinearLR(optimizer_sso, start_factor=0.1, total_iters=warmup_iters)
+main_scheduler_sso = CosineAnnealingLR(optimizer_sso, T_max=T_max, eta_min=min_lr)
+scheduler_sso = SequentialLR(optimizer_sso, [warmup_scheduler_sso, main_scheduler_sso], milestones=[warmup_iters])
+
+# Schedulers for AdamW
+warmup_scheduler_adamw = LinearLR(optimizer_adamw, start_factor=0.1, total_iters=warmup_iters)
+main_scheduler_adamw = CosineAnnealingLR(optimizer_adamw, T_max=T_max, eta_min=min_lr)
+scheduler_adamw = SequentialLR(optimizer_adamw, [warmup_scheduler_adamw, main_scheduler_adamw], milestones=[warmup_iters])
 
 # Compile after wrapping with FSDP
 if USE_COMPILE_MODEL:
     model = torch.compile(model)
 
-# Momentum scheduler for Muon optimizer (copied from Karpathy's nanochat)
-def get_muon_momentum(it):
-    frac = min(it / 300, 1)
-    momentum = (1 - frac) * 0.85 + frac * 0.95
-    return momentum
-
 def optimizer_step(step=None):
+    # Step both optimizers
+    optimizer_sso.step()
+    optimizer_adamw.step()
     
-    for group in optimizer_muon.param_groups:
-        group["mu"] = get_muon_momentum(step)  # NorMuon uses 'mu' not 'momentum'
-    
-    optimizer_muon.step()
-    scheduler_muon.step()
+    # Step schedulers
+    scheduler_sso.step()
+    scheduler_adamw.step()
     
 def optimizer_zero_grad():
-    optimizer_muon.zero_grad(set_to_none=True)
+    optimizer_sso.zero_grad(set_to_none=True)
+    optimizer_adamw.zero_grad(set_to_none=True)
 
 t0 = time.time()  
 total_training_time = 0  # Track total time (excluding first few iterations)
@@ -710,7 +754,7 @@ for iter in range(max_iters):
                 "train/mfu": mfu,
                 "train/iter_time": avg_iter_time,
                 "train/total_time_min": total_training_time / 60,
-                "lr/muon": scheduler_muon.get_last_lr()[0],
+                "lr/muon": scheduler_sso.get_last_lr()[0],
                 # "lr/adamw_embedding": scheduler_adamw_embedding.get_last_lr()[0],
                 # "lr/adamw_unembedding": scheduler_adamw_unembedding.get_last_lr()[0],
                 "system/gpu_memory_gb": mem_used_GB,
