@@ -602,7 +602,7 @@ from sso import SSO
 # Separate optimizers: SSO for 2D hidden weights, AdamW for others
 # Note: Using hyperparameters from Megatron script spball_1.8B_mupinit_muplr5e-3_wd0.1_hard_headfc1split.sh
 # Excluding LR as requested.
-USE_SSO = True
+USE_SSO = False
 # SSO Optimizer
 
 if USE_SSO:
@@ -611,7 +611,7 @@ if USE_SSO:
         lr=0.02,                   # User provided
         momentum_beta=0.9,         # Script: 0.9
         weight_decay=0.0,          # Script: Linear weights have 0.0 decay in Megatron implementation of SSO
-        use_nesterov=True,         # Script: --spectral-ball-use-nesterov
+        use_nesterov=True,         # Script: --spectral-ball-use-nesterov (enabled in paper)
         msign_steps=8,             # Script: 8
         radius_mode="spectral_mup",# Script: spectral_mup
         scale_mode="spectral_mup", # Script: spectral_mup
@@ -629,7 +629,8 @@ else:
         weight_decay=0.01,   
         cautious_wd= True,
         use_triton=True,
-        mu=0.9
+        mu=0.9,
+        # nesterov=True
     )
 
 

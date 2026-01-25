@@ -114,10 +114,12 @@ def power_iteration(w: torch.Tensor, steps: int = 50, eps: float = 1e-20, v_init
 
     if v_init is not None:
         v = v_init.to(w_bf16.dtype)
-        # Add small noise to break symmetry/orthogonality traps if cached
-        v = v + 1e-4 * torch.randn_like(v)
+        # Note: Removed random noise injection to ensure DDP consistency across ranks.
+        # If ranks have different seeds (standard for data loading), random noise would cause
+        # weight divergence between GPUs.
     else:
-        v = torch.randn_like(w_bf16[..., :1, :].transpose(-2, -1))
+        # Use deterministic initialization (ones) instead of random
+        v = torch.ones_like(w_bf16[..., :1, :].transpose(-2, -1))
         
     for _ in range(steps):
         v = torch.nn.functional.normalize(w_bf16.transpose(-2, -1) @ (w_bf16 @ v), dim=-2)
@@ -403,12 +405,14 @@ class SSO(Optimizer):
                 # "This is because SpectralBall already constrains weights to spectral sphere"
                 # So we SKIP standard weight decay here!
                 
-                # Update Momentum
-                buf.mul_(momentum_beta).add_(grad)
+                # Update Momentum with proper EMA formula: buf = β * buf + (1-β) * grad
+                # This matches Megatron's: exp_avg.lerp_(grad, 1 - momentum_beta)
+                buf.lerp_(grad, 1 - momentum_beta)
 
-                # Nesterov
+                # Nesterov momentum: M = (1-β) * grad + β * buf
+                # This matches Megatron's: grad.lerp(exp_avg, momentum_beta)
                 if use_nesterov:
-                    M = buf.mul(momentum_beta).add(grad)
+                    M = grad.lerp(buf, momentum_beta)
                 else:
                     M = buf
                 
